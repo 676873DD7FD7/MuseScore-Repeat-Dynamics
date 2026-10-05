@@ -10,7 +10,7 @@
 git clone --recursive https://github.com/musescore/MuseScore.git
 cd MuseScore
 git apply 0001-Add-repeat-aware-playback-dynamics-playbackCount-sup.patch
-
+```
 0.0.1
 
 可以通过输入mf等记号选择力度
