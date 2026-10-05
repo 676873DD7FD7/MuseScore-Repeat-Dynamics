@@ -1,0 +1,1461 @@
+From 4aed1bdd27c4bc27a1ec7ebd99b8f1da2bcdf0b9 Mon Sep 17 00:00:00 2001
+From: 676873DD7FD7 <676873DD7FD7@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 17:20:22 +0800
+Subject: [PATCH] Add repeat-aware playback dynamics: playbackCount support in
+ PlaybackContext, PLAYBACK_RANGES property, UI and .mscx read/write
+
+---
+ .../compat/midi/compatmidirenderinternal.cpp  | 238 ++++++++++--------
+ .../compat/midi/compatmidirenderinternal.h    |   6 +-
+ src/engraving/compat/midi/velocitymap.cpp     | 105 +++++---
+ src/engraving/compat/midi/velocitymap.h       |  13 +-
+ src/engraving/dom/measure.cpp                 |  43 ++++
+ src/engraving/dom/measure.h                   |  16 ++
+ src/engraving/dom/property.cpp                |   2 +-
+ src/engraving/dom/property.h                  |   2 +
+ src/engraving/playback/playbackcontext.cpp    | 116 ++++++++-
+ src/engraving/playback/playbackcontext.h      |   1 +
+ src/engraving/playback/playbackmodel.cpp      |  13 +
+ src/engraving/rw/read500/measureread.cpp      |  23 ++
+ src/engraving/rw/write/measurewrite.cpp       |  13 +
+ .../notation/barlines/BarlineSettings.qml     | 173 ++++++++++++-
+ .../barlines/barlinesettingsmodel.cpp         |  88 +++++++
+ .../notation/barlines/barlinesettingsmodel.h  |   6 +
+ 16 files changed, 699 insertions(+), 159 deletions(-)
+
+diff --git a/src/engraving/compat/midi/compatmidirenderinternal.cpp b/src/engraving/compat/midi/compatmidirenderinternal.cpp
+index 63bf18c090..45ed0e7ae3 100644
+--- a/src/engraving/compat/midi/compatmidirenderinternal.cpp
++++ b/src/engraving/compat/midi/compatmidirenderinternal.cpp
+@@ -671,21 +671,21 @@ static bool letRingShouldApply(const NoteEvent& event, const Note* note)
+ }
+ 
+ static void renderSnd(EventsHolder& events, const Chord* chord, int noteChannel, int tickOffset,
+-                      const CompatMidiRendererInternal::Context& context)
++                      const CompatMidiRendererInternal::Context& context, int playbackCount)
+ {
+     Fraction stick = chord->tick();
+     Fraction etick = stick + chord->ticks();
+     const VelocityMap& veloEvents = context.velocitiesByTrack.at(chord->track());
+     const VelocityMap& multEvents = context.velocityMultiplicationsByTrack.at(chord->track());
+-    auto changes = veloEvents.changesInRange(stick, etick);
+-    auto multChanges = multEvents.changesInRange(stick, etick);
++    auto changes = veloEvents.changesInRange(stick, etick, playbackCount);
++    auto multChanges = multEvents.changesInRange(stick, etick, playbackCount);
+ 
+     std::map<int, int> velocityMap;
+     for (auto& change : changes) {
+         int lastVal = -1;
+         int endPoint = change.second.ticks();
+         for (int t = change.first.ticks(); t <= endPoint; t++) {
+-            int velo = veloEvents.val(Fraction::fromTicks(t));
++            int velo = veloEvents.val(Fraction::fromTicks(t), playbackCount);
+             if (velo == lastVal) {
+                 continue;
+             }
+@@ -714,7 +714,7 @@ static void renderSnd(EventsHolder& events, const Chord* chord, int noteChannel,
+         }
+ 
+         for (int t = change.first.ticks(); t <= endPoint; t++) {
+-            int mult = multEvents.val(Fraction::fromTicks(t));
++            int mult = multEvents.val(Fraction::fromTicks(t), playbackCount);
+             if (mult == lastVal || mult == CONVERSION_FACTOR) {
+                 continue;
+             }
+@@ -790,7 +790,7 @@ static int calculateTieLength(const Note* note)
+ //---------------------------------------------------------
+ 
+ static void collectNote(EventsHolder& events, const Note* note, const CollectNoteParams& noteParams, Staff* staff,
+-                        PitchWheelRenderer& pitchWheelRenderer, const CompatMidiRendererInternal::Context& context)
++                        PitchWheelRenderer& pitchWheelRenderer, const CompatMidiRendererInternal::Context& context, int playbackCount)
+ {
+     if (!note->play() || note->hidden()) {      // do not play overlapping notes
+         return;
+@@ -884,7 +884,7 @@ static void collectNote(EventsHolder& events, const Note* note, const CollectNot
+         // Get the velocity used for this note from the staff
+         // This allows correct playback of tremolos even without SND enabled.
+         Fraction nonUnwoundTick = Fraction::fromTicks(on - noteParams.tickOffset);
+-        int velo = context.velocitiesByTrack.at(note->track()).val(nonUnwoundTick) * noteParams.velocityMultiplier * e.velocityMultiplier();
++        int velo = context.velocitiesByTrack.at(note->track()).val(nonUnwoundTick, playbackCount) * noteParams.velocityMultiplier * e.velocityMultiplier();
+         if (e.play()) {
+             PlayNoteParams playParams;
+             MidiInstrumentEffect eventEffect = noteEffect;
+@@ -911,7 +911,7 @@ static void collectNote(EventsHolder& events, const Note* note, const CollectNot
+             playNote(events, note, playParams, pitchWheelRenderer);
+ 
+             if (instr->singleNoteDynamics()) {
+-                renderSnd(events, chord, noteChannel, noteParams.tickOffset, context);
++                renderSnd(events, chord, noteChannel, noteParams.tickOffset, context, playbackCount);
+             }
+         }
+     }
+@@ -1080,7 +1080,7 @@ static void renderHarmony(EventsHolder& events, Measure const* m, Harmony* h, in
+ void CompatMidiRendererInternal::collectGraceBeforeChordEvents(Chord* chord, Chord* prevChord, EventsHolder& events, double veloMultiplier,
+                                                                Staff* st,
+                                                                int tickOffset,
+-                                                               PitchWheelRenderer& pitchWheelRenderer, MidiInstrumentEffect effect)
++                                                               PitchWheelRenderer& pitchWheelRenderer, MidiInstrumentEffect effect, int playbackCount)
+ {
+     // calculate offset for grace notes here
+     const std::vector<Chord*> grChords = chord->graceNotesBefore(); // create copy
+@@ -1135,14 +1135,14 @@ void CompatMidiRendererInternal::collectGraceBeforeChordEvents(Chord* chord, Cho
+                     params.graceOffsetOn = graceTickSum - graceTickOffset * currentBeaforeBeatNote;
+                     params.graceOffsetOff = graceTickSum - graceTickOffset * (currentBeaforeBeatNote + 1);
+ 
+-                    collectNote(events, note, params, st, pitchWheelRenderer, m_context);
++                    collectNote(events, note, params, st, pitchWheelRenderer, m_context, playbackCount);
+                 } else if (isGraceBend) {
+                     params.graceOffsetOn = graceTickSum;
+                     params.graceOffsetOff = 0;
+ 
+-                    collectNote(events, note, params, st, pitchWheelRenderer, m_context);
++                    collectNote(events, note, params, st, pitchWheelRenderer, m_context, playbackCount);
+                 } else {
+-                    collectNote(events, note, params, st, pitchWheelRenderer, m_context);
++                    collectNote(events, note, params, st, pitchWheelRenderer, m_context, playbackCount);
+                 }
+             }
+ 
+@@ -1205,7 +1205,7 @@ CompatMidiRendererInternal::ChordParams CompatMidiRendererInternal::collectChord
+ //---------------------------------------------------------
+ 
+ void CompatMidiRendererInternal::doCollectMeasureEvents(EventsHolder& events, Measure const* m, const Staff* staff, int tickOffset,
+-                                                        PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords)
++                                                        PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords, int playbackCount)
+ {
+     staff_idx_t firstStaffIdx = staff->idx();
+     for (Staff* st : staff->masterScore()->staves()) {
+@@ -1268,7 +1268,7 @@ void CompatMidiRendererInternal::doCollectMeasureEvents(EventsHolder& events, Me
+                 effect = MidiInstrumentEffect::HAMMER_PULL;
+             }
+ 
+-            collectGraceBeforeChordEvents(chord, prevChords[voice], events, veloMultiplier, st1, tickOffset, pitchWheelRenderer, effect);
++            collectGraceBeforeChordEvents(chord, prevChords[voice], events, veloMultiplier, st1, tickOffset, pitchWheelRenderer, effect, playbackCount);
+ 
+             Instrument* instr = st1->part()->instrument(tick);
+             for (const Note* note : chord->notes()) {
+@@ -1285,7 +1285,7 @@ void CompatMidiRendererInternal::doCollectMeasureEvents(EventsHolder& events, Me
+                     params.callAllSoundOff = true;
+                 }
+ 
+-                collectNote(events, note, params, st1, pitchWheelRenderer, m_context);
++                collectNote(events, note, params, st1, pitchWheelRenderer, m_context, playbackCount);
+             }
+ 
+             if (!graceNotesMerged(chord)) {
+@@ -1296,7 +1296,7 @@ void CompatMidiRendererInternal::doCollectMeasureEvents(EventsHolder& events, Me
+                         params.velocityMultiplier = veloMultiplier;
+                         params.tickOffset = tickOffset;
+                         params.effect = effect;
+-                        collectNote(events, note, params, st1, pitchWheelRenderer, m_context);
++                        collectNote(events, note, params, st1, pitchWheelRenderer, m_context, playbackCount);
+                     }
+                 }
+             }
+@@ -1317,9 +1317,9 @@ CompatMidiRendererInternal::CompatMidiRendererInternal(Score* s)
+ //---------------------------------------------------------
+ 
+ void CompatMidiRendererInternal::collectMeasureEvents(EventsHolder& events, Measure const* m, const Staff* staff, int tickOffset,
+-                                                      PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords)
++                                                      PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords, int playbackCount)
+ {
+-    doCollectMeasureEvents(events, m, staff, tickOffset, pitchWheelRenderer, prevChords);
++    doCollectMeasureEvents(events, m, staff, tickOffset, pitchWheelRenderer, prevChords, playbackCount);
+ 
+     collectProgramChanges(events, m, staff, tickOffset);
+ }
+@@ -1337,6 +1337,7 @@ void CompatMidiRendererInternal::renderStaff(EventsHolder& events, const Staff*
+ 
+     for (const RepeatSegment* rs : repeatList) {
+         const int tickOffset = rs->utick - rs->tick;
++        const int playbackCount = rs->playbackCount;
+ 
+         Measure const* const start = rs->firstMeasure();
+ 
+@@ -1354,10 +1355,10 @@ void CompatMidiRendererInternal::renderStaff(EventsHolder& events, const Staff*
+                 }
+ 
+                 int offset = (m->tick() - playMeasure->tick()).ticks();
+-                collectMeasureEvents(events, playMeasure, staff, tickOffset + offset, pitchWheelRenderer, prevChords);
++                collectMeasureEvents(events, playMeasure, staff, tickOffset + offset, pitchWheelRenderer, prevChords, playbackCount);
+             } else {
+                 lastMeasure = m;
+-                collectMeasureEvents(events, lastMeasure, staff, tickOffset, pitchWheelRenderer, prevChords);
++                collectMeasureEvents(events, lastMeasure, staff, tickOffset, pitchWheelRenderer, prevChords, playbackCount);
+             }
+ 
+             if (m == rs->lastMeasure()) {
+@@ -1804,114 +1805,138 @@ void fillScoreVelocities(const Score* score, CompatMidiRendererInternal::Context
+         return;
+     }
+ 
+-    for (Segment* s = mainScore->firstMeasure()->first(); s; s = s->next1()) {
+-        Fraction tick = s->tick();
+-        for (const EngravingItem* e : s->annotations()) {
+-            if (!e->isDynamic() || !e->staff()->isPrimaryStaff()) {
+-                continue;
+-            }
++    // 硬编码测试：第一遍 mf(80)，第二遍 f(96)
++    constexpr int HARDCODED_VELO_FIRST = 40;   // mf
++    constexpr int HARDCODED_VELO_SECOND = 100;  // f
+ 
+-            const Dynamic* d = toDynamic(e);
+-            int v = d->velocity();
+-
+-            // treat an invalid dynamic as no change, i.e. a dynamic set to 0
+-            if (v < 1) {
+-                continue;
+-            }
++    const RepeatList& repeatList = score->repeatList();
+ 
+-            // make sure value is legal
+-            v = std::clamp(v, 1, 127);
++    for (const RepeatSegment* rs : repeatList) {
++        const int playbackCount = rs->playbackCount;
++        const Fraction tickOffset = Fraction::fromTicks(rs->utick - rs->tick);
+ 
+-            // If a dynamic has 'velocity change' update its ending
+-            int change = d->changeInVelocity();
+-            ChangeDirection direction = ChangeDirection::INCREASING;
+-            if (change < 0) {
+-                direction = ChangeDirection::DECREASING;
+-            }
++        for (Measure const* m = rs->firstMeasure(); m; m = m->nextMeasure()) {
++            for (Segment* s = m->first(); s; s = s->next1()) {
++                Fraction tick = s->tick() + tickOffset;
+ 
+-            switch (d->voiceAssignment()) {
+-            case VoiceAssignment::ALL_VOICE_IN_STAFF: {
+-                for (track_idx_t track = d->staffIdx() * VOICES; track < (d->staffIdx() + 1) * VOICES; ++track) {
+-                    context.velocitiesByTrack[track].addDynamic(tick, v);
+-                }
+-                if (change != 0) {
+-                    Fraction etick = tick + d->velocityChangeLength();
+-                    ChangeMethod method = ChangeMethod::NORMAL;
+-                    for (track_idx_t track = d->staffIdx() * VOICES; track < (d->staffIdx() + 1) * VOICES; ++track) {
+-                        context.velocitiesByTrack[track].addHairpin(tick, etick, change, method, direction);
++                for (const EngravingItem* e : s->annotations()) {
++                    if (!e->isDynamic() || !e->staff()->isPrimaryStaff()) {
++                        continue;
+                     }
+-                }
+-            }
+-            break;
+-            case VoiceAssignment::ALL_VOICE_IN_INSTRUMENT: {
+-                Part* part = d->staff()->part();
+-                staff_idx_t pStartStaff = part->staves().front()->idx();
+-                staff_idx_t pEndStaff = part->staves().back()->idx();
+-                if (d->staffIdx() < pStartStaff || d->staffIdx() > pEndStaff) {
+-                    break;
+-                }
+-                for (staff_idx_t staffIdx = pStartStaff; staffIdx <= pEndStaff; ++staffIdx) {
+-                    Staff* stp = mainScore->staff(staffIdx);
+-                    if (!stp->isPrimaryStaff()) {
++
++                    const Dynamic* d = toDynamic(e);
++                    int v = d->velocity();
++                    if (v < 1) {
+                         continue;
+                     }
+-                    for (track_idx_t track = stp->idx() * VOICES; track < (stp->idx() + 1) * VOICES; ++track) {
+-                        context.velocitiesByTrack[track].addDynamic(tick, v);
++                    v = std::clamp(v, 1, 127);
++                    {
++    FILE* f = fopen("C:/msbuild/debug_velocity.txt", "a");
++    if (f) {
++        fprintf(f, "fillScoreVelocities playbackCount=%d tick=%d v=%d\n", playbackCount, tick.ticks(), v);
++        fclose(f);
++    }
++}
++
++                    // 硬编码：按遍数覆盖力度
++                    if (playbackCount == 1) {
++                        v = HARDCODED_VELO_FIRST;
++                    } else if (playbackCount == 2) {
++                        v = HARDCODED_VELO_SECOND;
+                     }
+-                    if (change != 0) {
+-                        Fraction etick = tick + d->velocityChangeLength();
+-                        ChangeMethod method = ChangeMethod::NORMAL;
+-                        for (track_idx_t track = stp->idx() * VOICES; track < (stp->idx() + 1) * VOICES; ++track) {
+-                            context.velocitiesByTrack[track].addHairpin(tick, etick, change, method, direction);
+-                        }
++
++                    int change = d->changeInVelocity();
++                    ChangeDirection direction = ChangeDirection::INCREASING;
++                    if (change < 0) {
++                        direction = ChangeDirection::DECREASING;
+                     }
+-                }
+-            }
+-            break;
+-            case VoiceAssignment::CURRENT_VOICE_ONLY: {
+-                context.velocitiesByTrack[d->track()].addDynamic(tick, v);
+-                if (change != 0) {
+-                    Fraction etick = tick + d->velocityChangeLength();
+-                    ChangeMethod method = ChangeMethod::NORMAL;
+-                    context.velocitiesByTrack[d->track()].addHairpin(tick, etick, change, method, direction);
+-                }
+-            }
+-            break;
+-            }
+-        }
+ 
+-        if (s->isChordRestType()) {
+-            for (track_idx_t track = 0; track < mainScore->ntracks(); ++track) {
+-                EngravingItem* el = s->element(track);
+-                if (!el || !el->isChord() || !el->staff()->isPrimaryStaff()) {
+-                    continue;
++                    switch (d->voiceAssignment()) {
++                    case VoiceAssignment::ALL_VOICE_IN_STAFF: {
++                        for (track_idx_t track = d->staffIdx() * VOICES; track < (d->staffIdx() + 1) * VOICES; ++track) {
++                            context.velocitiesByTrack[track].addDynamic(tick, v, playbackCount);
++                        }
++                        if (change != 0) {
++                            Fraction etick = tick + d->velocityChangeLength();
++                            ChangeMethod method = ChangeMethod::NORMAL;
++                            for (track_idx_t track = d->staffIdx() * VOICES; track < (d->staffIdx() + 1) * VOICES; ++track) {
++                                context.velocitiesByTrack[track].addHairpin(tick, etick, change, method, direction, playbackCount);
++                            }
++                        }
++                    }
++                    break;
++                    case VoiceAssignment::ALL_VOICE_IN_INSTRUMENT: {
++                        Part* part = d->staff()->part();
++                        staff_idx_t pStartStaff = part->staves().front()->idx();
++                        staff_idx_t pEndStaff = part->staves().back()->idx();
++                        if (d->staffIdx() < pStartStaff || d->staffIdx() > pEndStaff) {
++                            break;
++                        }
++                        for (staff_idx_t staffIdx = pStartStaff; staffIdx <= pEndStaff; ++staffIdx) {
++                            Staff* stp = mainScore->staff(staffIdx);
++                            if (!stp->isPrimaryStaff()) {
++                                continue;
++                            }
++                            for (track_idx_t track = stp->idx() * VOICES; track < (stp->idx() + 1) * VOICES; ++track) {
++                                context.velocitiesByTrack[track].addDynamic(tick, v, playbackCount);
++                            }
++                            if (change != 0) {
++                                Fraction etick = tick + d->velocityChangeLength();
++                                ChangeMethod method = ChangeMethod::NORMAL;
++                                for (track_idx_t track = stp->idx() * VOICES; track < (stp->idx() + 1) * VOICES; ++track) {
++                                    context.velocitiesByTrack[track].addHairpin(tick, etick, change, method, direction, playbackCount);
++                                }
++                            }
++                        }
++                    }
++                    break;
++                    case VoiceAssignment::CURRENT_VOICE_ONLY: {
++                        context.velocitiesByTrack[d->track()].addDynamic(tick, v, playbackCount);
++                        if (change != 0) {
++                            Fraction etick = tick + d->velocityChangeLength();
++                            ChangeMethod method = ChangeMethod::NORMAL;
++                            context.velocitiesByTrack[d->track()].addHairpin(tick, etick, change, method, direction, playbackCount);
++                        }
++                    }
++                    break;
++                    }
+                 }
+ 
+-                Chord* chord = toChord(el);
+-
+-                double veloMultiplier = chordVelocityMultiplier(chord, context);
+-
+-                if (muse::RealIsEqual(veloMultiplier, 1.0)) {
+-                    continue;
++                // 和弦力度倍率也要按遍数处理
++                if (s->isChordRestType()) {
++                    for (track_idx_t track = 0; track < mainScore->ntracks(); ++track) {
++                        EngravingItem* el = s->element(track);
++                        if (!el || !el->isChord() || !el->staff()->isPrimaryStaff()) {
++                            continue;
++                        }
++                        Chord* chord = toChord(el);
++                        double veloMultiplier = chordVelocityMultiplier(chord, context);
++                        if (muse::RealIsEqual(veloMultiplier, 1.0)) {
++                            continue;
++                        }
++                        Fraction ARTICULATION_CHANGE_TIME = std::min(s->ticks(), ARTICULATION_CHANGE_TIME_MAX);
++                        int start = veloMultiplier * CompatMidiRendererInternal::ARTICULATION_CONV_FACTOR;
++                        int change = (veloMultiplier - 1) * CompatMidiRendererInternal::ARTICULATION_CONV_FACTOR;
++                        context.velocityMultiplicationsByTrack[track].addDynamic(tick, start, playbackCount);
++                        context.velocityMultiplicationsByTrack[track].addHairpin(tick, tick + ARTICULATION_CHANGE_TIME,
++                                                                                 change, ChangeMethod::NORMAL,
++                                                                                 ChangeDirection::DECREASING, playbackCount);
++                    }
+                 }
+-
+-                Fraction ARTICULATION_CHANGE_TIME = std::min(s->ticks(), ARTICULATION_CHANGE_TIME_MAX);
+-                int start = veloMultiplier * CompatMidiRendererInternal::ARTICULATION_CONV_FACTOR;
+-                int change = (veloMultiplier - 1) * CompatMidiRendererInternal::ARTICULATION_CONV_FACTOR;
+-                context.velocityMultiplicationsByTrack[track].addDynamic(chord->tick(), start);
+-                context.velocityMultiplicationsByTrack[track].addHairpin(chord->tick(),
+-                                                                         chord->tick() + ARTICULATION_CHANGE_TIME, change, ChangeMethod::NORMAL,
+-                                                                         ChangeDirection::DECREASING);
++            }
++            
++            if (m == rs->lastMeasure()) {
++                break;
+             }
+         }
+     }
+ 
++    // 后面的 hairpin、setup、volta 保持不变
+     for (const auto& sp : mainScore->spannerMap().map()) {
+         Spanner* s = sp.second;
+         if (!s->isHairpin() || !s->staff()->isPrimaryStaff()) {
+             continue;
+         }
+-
+         fillHairpinVelocities(toHairpin(s), context.velocitiesByTrack);
+     }
+ 
+@@ -1930,7 +1955,6 @@ void fillScoreVelocities(const Score* score, CompatMidiRendererInternal::Context
+         if (!spanner->isVolta()) {
+             continue;
+         }
+-
+         Volta* volta = toVolta(spanner);
+         Staff* st = volta->staff();
+         if (!st->isPrimaryStaff()) {
+diff --git a/src/engraving/compat/midi/compatmidirenderinternal.h b/src/engraving/compat/midi/compatmidirenderinternal.h
+index 1facbb6c4a..a1f79da68f 100644
+--- a/src/engraving/compat/midi/compatmidirenderinternal.h
++++ b/src/engraving/compat/midi/compatmidirenderinternal.h
+@@ -190,9 +190,9 @@ private:
+                           MidiInstrumentEffect effect);
+ 
+     void collectMeasureEvents(EventsHolder& events, Measure const* m, const Staff* sctx, int tickOffset,
+-                              PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords);
++                              PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords, int playbackCount);
+     void doCollectMeasureEvents(EventsHolder& events, Measure const* m, const Staff* sctx, int tickOffset,
+-                                PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords);
++                                PitchWheelRenderer& pitchWheelRenderer, std::array<Chord*, VOICES>& prevChords, int playbackCount);
+ 
+     struct ChordParams {
+         bool letRing = false;
+@@ -203,7 +203,7 @@ private:
+ 
+     ChordParams collectChordParams(const Chord* chord, int tickOffset) const;
+     void collectGraceBeforeChordEvents(Chord* chord, Chord* prevChord, EventsHolder& events, double veloMultiplier, Staff* st,
+-                                       int tickOffset, PitchWheelRenderer& pitchWheelRenderer, MidiInstrumentEffect effect);
++                                       int tickOffset, PitchWheelRenderer& pitchWheelRenderer, MidiInstrumentEffect effect, int playbackCount);
+     void fillArticulationsInfo();
+ 
+     Score* score = nullptr;
+diff --git a/src/engraving/compat/midi/velocitymap.cpp b/src/engraving/compat/midi/velocitymap.cpp
+index 5290302513..d43254ae0a 100644
+--- a/src/engraving/compat/midi/velocitymap.cpp
++++ b/src/engraving/compat/midi/velocitymap.cpp
+@@ -135,36 +135,71 @@ int VelocityMap::interpolate(Fraction& eventTick, VelocityEvent& event, Fraction
+ ///   return value at tick position.
+ //---------------------------------------------------------
+ 
+-int VelocityMap::val(Fraction tick) const
++int VelocityMap::val(Fraction tick, int playbackCount) const
+ {
++    // 辅助：在某个 tick 上，找匹配 playbackCount 的事件
++    // 优先精确匹配，找不到回退到 playbackCount == 0
++    auto findEventAt = [&](Fraction t, const VelocityEvent** outEvent) -> bool {
++        auto range = equal_range(t);
++        const VelocityEvent* fallback = nullptr;
++        for (auto it = range.first; it != range.second; ++it) {
++            if (it->second.m_playbackCount == playbackCount) {
++                *outEvent = &it->second;
++                return true;
++            }
++            if (it->second.m_playbackCount == 0) {
++                fallback = &it->second;
++            }
++        }
++        if (fallback) {
++            *outEvent = fallback;
++            return true;
++        }
++        return false;
++    };
++
+     auto eventIter = upper_bound(tick);
+     if (eventIter == begin()) {
+         return DEFAULT_VALUE;
+     }
+-
+     eventIter--;
++
++    const VelocityEvent* found = nullptr;
++    Fraction foundTick = eventIter->first;
++
++    // 从最近的 tick 往前回溯，找第一个匹配的事件
++    auto it = eventIter;
++    while (true) {
++        if (findEventAt(it->first, &found)) {
++            foundTick = it->first;
++            break;
++        }
++        if (it == begin()) {
++            return DEFAULT_VALUE;
++        }
++        --it;
++    }
++
++    // 在 foundTick 上，看看有没有 hairpin（它可能和 dynamic 在同一 tick）
+     bool foundHairpin = false;
+-    VelocityEvent hairpinFound = eventIter->second;         // only used to init
+-    Fraction hairpinFoundStartTick = eventIter->first;
+-    auto values = equal_range(hairpinFoundStartTick);
+-    for (auto it = values.first; it != values.second; ++it) {
+-        auto& event = it->second;
+-        if (event.m_type == VelocityEventType::HAIRPIN) {
++    VelocityEvent hairpinFound;
++    auto values = equal_range(foundTick);
++    for (auto vit = values.first; vit != values.second; ++vit) {
++        auto& event = vit->second;
++        if (event.m_type == VelocityEventType::HAIRPIN
++            && (event.m_playbackCount == 0 || event.m_playbackCount == playbackCount)) {
+             foundHairpin = true;
+             hairpinFound = event;
+         }
+     }
+-
+     if (!foundHairpin) {
+-        // Last event must be a dynamic, since there are max two events at one tick
+-        return eventIter->second.m_value;
++        return found->m_value;
+     }
+ 
+-    if (tick >= (hairpinFoundStartTick + hairpinFound.m_length)) {
++    if (tick >= (foundTick + hairpinFound.m_length)) {
+         return hairpinFound.m_cachedEndVal;
+     } else {
+-        // Do some maths!
+-        return interpolate(hairpinFoundStartTick, hairpinFound, tick);        // NOTE:JT check should hairpinFound be eventIter.value()
++        return interpolate(foundTick, hairpinFound, tick);
+     }
+ }
+ 
+@@ -172,9 +207,11 @@ int VelocityMap::val(Fraction tick) const
+ //   addDynamic
+ //---------------------------------------------------------
+ 
+-void VelocityMap::addDynamic(Fraction tick, int value)
++void VelocityMap::addDynamic(Fraction tick, int value, int playbackCount)
+ {
+-    insert({ tick, VelocityEvent(value) });
++    VelocityEvent e(value);
++    e.m_playbackCount = playbackCount;
++    insert({ tick, e });
+ }
+ 
+ //---------------------------------------------------------
+@@ -183,11 +220,13 @@ void VelocityMap::addDynamic(Fraction tick, int value)
+ ///   velocity event.
+ //---------------------------------------------------------
+ 
+-void VelocityMap::addHairpin(Fraction stick, Fraction etick, int change, ChangeMethod method, ChangeDirection direction)
++void VelocityMap::addHairpin(Fraction stick, Fraction etick, int change, ChangeMethod method, ChangeDirection direction, int playbackCount)
+ {
+     change = std::abs(change);
+     change *= (direction == ChangeDirection::INCREASING) ? 1 : -1;
+-    insert({ stick, VelocityEvent(stick, etick, change, method, direction) });
++    VelocityEvent e(stick, etick, change, method, direction);
++    e.m_playbackCount = playbackCount;
++    insert({ stick, e });
+ }
+ 
+ //---------------------------------------------------------
+@@ -336,12 +375,13 @@ void VelocityMap::resolveDynamicInsideHairpinCollisions()
+     }
+ }
+ 
+-bool VelocityMap::dynamicExistsOnTick(Fraction tick) const
++bool VelocityMap::dynamicExistsOnTick(Fraction tick, int playbackCount) const
+ {
+     auto values = equal_range(tick);
+     for (auto it = values.first; it != values.second; ++it) {
+         auto& event = it->second;
+-        if (event.m_type == VelocityEventType::DYNAMIC) {
++        if (event.m_type == VelocityEventType::DYNAMIC
++            && (event.m_playbackCount == 0 || event.m_playbackCount == playbackCount)) {
+             return true;
+         }
+     }
+@@ -349,12 +389,13 @@ bool VelocityMap::dynamicExistsOnTick(Fraction tick) const
+     return false;
+ }
+ 
+-VelocityEvent VelocityMap::dynamicEventForTick(Fraction tick) const
++VelocityEvent VelocityMap::dynamicEventForTick(Fraction tick, int playbackCount) const
+ {
+     auto equalValues = equal_range(tick);
+     for (auto it = equalValues.first; it != equalValues.second; ++it) {
+         auto& event = it->second;
+-        if (event.m_type == VelocityEventType::DYNAMIC) {
++        if (event.m_type == VelocityEventType::DYNAMIC
++            && (event.m_playbackCount == 0 || event.m_playbackCount == playbackCount)) {
+             return event;
+         }
+     }
+@@ -367,7 +408,8 @@ VelocityEvent VelocityMap::dynamicEventForTick(Fraction tick) const
+     auto smallerValues = equal_range(previousIt->first);
+     for (auto it = smallerValues.first; it != smallerValues.second; ++it) {
+         auto& event = it->second;
+-        if (event.m_type == VelocityEventType::DYNAMIC) {
++        if (event.m_type == VelocityEventType::DYNAMIC
++            && (event.m_playbackCount == 0 || event.m_playbackCount == playbackCount)) {
+             return event;
+         }
+     }
+@@ -389,15 +431,15 @@ void VelocityMap::addMissingDynamicsAfterHairpins()
+         if (event.m_type == VelocityEventType::HAIRPIN && event.m_value == 0) {
+             Fraction startHairpinTick = it->first;
+             Fraction endHairpinTick = it->first + it->second.m_length;
+-            VelocityEvent dynamicOnCurrentTick = dynamicEventForTick(startHairpinTick);
++            VelocityEvent dynamicOnCurrentTick = dynamicEventForTick(startHairpinTick, 0);
+ 
+-            if (!dynamicExistsOnTick(endHairpinTick)) {
++            if (!dynamicExistsOnTick(endHairpinTick, 0)) {
+                 if (dynamicOnCurrentTick.m_type != VelocityEventType::INVALID) {
+                     int newVal = nextDynamicVal(dynamicOnCurrentTick.m_value, event.m_direction);
+                     insert({ endHairpinTick, VelocityEvent(newVal) });
+                 }
+             } else {
+-                VelocityEvent dynamicOnEndTick = dynamicEventForTick(endHairpinTick);
++                VelocityEvent dynamicOnEndTick = dynamicEventForTick(endHairpinTick, 0);
+                 int velocityJump = dynamicOnEndTick.m_value - dynamicOnCurrentTick.m_value;
+ 
+                 if ((event.m_direction
+@@ -533,7 +575,7 @@ void VelocityMap::setup()
+ ///   returns a list of changes in a range, and their start and end points
+ //---------------------------------------------------------
+ 
+-std::vector<std::pair<Fraction, Fraction> > VelocityMap::changesInRange(Fraction stick, Fraction etick) const
++std::vector<std::pair<Fraction, Fraction> > VelocityMap::changesInRange(Fraction stick, Fraction etick, int playbackCount) const
+ {
+     std::vector<std::pair<Fraction, Fraction> > tempChanges;
+ 
+@@ -546,6 +588,12 @@ std::vector<std::pair<Fraction, Fraction> > VelocityMap::changesInRange(Fraction
+         }
+ 
+         auto& event = iter->second;
++
++        // 过滤掉不属于当前遍数的事件
++        if (event.m_playbackCount != 0 && event.m_playbackCount != playbackCount) {
++            continue;
++        }
++
+         if (event.m_type == VelocityEventType::DYNAMIC) {
+             tempChanges.push_back(std::make_pair(tick, tick));
+         } else if (event.m_type == VelocityEventType::HAIRPIN) {
+@@ -560,7 +608,8 @@ std::vector<std::pair<Fraction, Fraction> > VelocityMap::changesInRange(Fraction
+     if (iter != begin()) {
+         iter--;
+         auto& event = iter->second;
+-        if (event.m_type == VelocityEventType::HAIRPIN) {
++        if (event.m_type == VelocityEventType::HAIRPIN
++            && (event.m_playbackCount == 0 || event.m_playbackCount == playbackCount)) {
+             Fraction eventEtick = iter->first + event.m_length;
+             if (eventEtick > stick) {
+                 tempChanges.push_back(std::make_pair(stick, eventEtick));
+diff --git a/src/engraving/compat/midi/velocitymap.h b/src/engraving/compat/midi/velocitymap.h
+index 2ed533dbb5..f00433ebfb 100644
+--- a/src/engraving/compat/midi/velocitymap.h
++++ b/src/engraving/compat/midi/velocitymap.h
+@@ -66,6 +66,7 @@ private:
+     ChangeDirection m_direction = ChangeDirection::INCREASING;
+     int m_cachedStartVal = -1;
+     int m_cachedEndVal = -1;
++    int m_playbackCount = 0;
+ };
+ 
+ //---------------------------------------------------------
+@@ -80,11 +81,11 @@ class VelocityMap : public std::multimap<Fraction, VelocityEvent>
+     OBJECT_ALLOCATOR(engraving, VelocityMap)
+ public:
+     VelocityMap() {}
+-    int val(Fraction tick) const;
+-    std::vector<std::pair<Fraction, Fraction> > changesInRange(Fraction stick, Fraction etick) const;
++    int val(Fraction tick, int playbackCount = 0) const;
++    std::vector<std::pair<Fraction, Fraction> > changesInRange(Fraction stick, Fraction etick, int playbackCount = 0) const;
+ 
+-    void addDynamic(Fraction tick, int value);
+-    void addHairpin(Fraction stick, Fraction etick, int change, ChangeMethod method, ChangeDirection direction);
++    void addDynamic(Fraction tick, int value, int playbackCount = 0);
++    void addHairpin(Fraction stick, Fraction etick, int change, ChangeMethod method, ChangeDirection direction, int playbackCount = 0);
+     void setup();
+ 
+     static int interpolate(Fraction& eventTick, VelocityEvent& event, Fraction& tick);
+@@ -102,8 +103,8 @@ private:
+     void resolveHairpinCollisions();
+     void resolveDynamicInsideHairpinCollisions();
+     void adjustCollidingHairpinsLength(std::vector<bool>& startsInHairpin, EndPointsVector& endPoints);
+-    bool dynamicExistsOnTick(Fraction tick) const;
+-    VelocityEvent dynamicEventForTick(Fraction tick) const;
++    bool dynamicExistsOnTick(Fraction tick, int playbackCount) const;
++    VelocityEvent dynamicEventForTick(Fraction tick, int playbackCount) const;
+     void addMissingDynamicsAfterHairpins();
+     void fillHairpinsCache();
+ 
+diff --git a/src/engraving/dom/measure.cpp b/src/engraving/dom/measure.cpp
+index b3369a7174..25c157a692 100644
+--- a/src/engraving/dom/measure.cpp
++++ b/src/engraving/dom/measure.cpp
+@@ -2891,6 +2891,24 @@ PropertyValue Measure::getProperty(Pid propertyId) const
+         return repeatStart();
+     case Pid::REPEAT_JUMP:
+         return repeatJump();
++    case Pid::PLAYBACK_RANGES: {
++        String s;
++        for (const PlaybackRange& range : m_playbackRanges) {
++            if (!s.empty()) {
++                s += u";";
++            }
++            s += String::number(range.startTick.ticks()) + u"-" + String::number(range.endTick.ticks()) + u":";
++            bool first = true;
++            for (const auto& [count, velo] : range.velocities) {
++                if (!first) {
++                    s += u",";
++                }
++                first = false;
++                s += String::number(count) + u"=" + String::number(velo);
++            }
++        }
++        return PropertyValue(s);
++    }
+     default:
+         return MeasureBase::getProperty(propertyId);
+     }
+@@ -2942,6 +2960,31 @@ bool Measure::setProperty(Pid propertyId, const PropertyValue& value)
+         setRepeatJump(value.toBool());
+         score()->invalidateRepeatList();
+         break;
++    case Pid::PLAYBACK_RANGES: {
++    m_playbackRanges.clear();
++        String s = value.value<String>();
++        for (const String& rangeStr : s.split(u';')) {
++            auto colon = rangeStr.split(u':');
++            if (colon.size() != 2) {
++                continue;
++            }
++            auto ticks = colon[0].split(u'-');
++            if (ticks.size() != 2) {
++                continue;
++            }
++            PlaybackRange range;
++            range.startTick = Fraction::fromTicks(ticks[0].toInt());
++            range.endTick = Fraction::fromTicks(ticks[1].toInt());
++            for (const String& vStr : colon[1].split(u',')) {
++                auto eq = vStr.split(u'=');
++                if (eq.size() != 2) {
++                    continue;
++                }
++                range.velocities[eq[0].toInt()] = eq[1].toInt();
++            }
++            m_playbackRanges.push_back(range);
++        }
++    } break;
+     default:
+         return MeasureBase::setProperty(propertyId, value);
+     }
+diff --git a/src/engraving/dom/measure.h b/src/engraving/dom/measure.h
+index 629f366c91..48a6029160 100644
+--- a/src/engraving/dom/measure.h
++++ b/src/engraving/dom/measure.h
+@@ -27,6 +27,9 @@
+  Definition of class Measure.
+ */
+ 
++#include <vector>
++#include <map>
++
+ #include "measurebase.h"
+ 
+ #include "segmentlist.h"
+@@ -52,6 +55,13 @@ class MeasureWrite;
+ }
+ 
+ namespace mu::engraving {
++
++struct PlaybackRange {
++    Fraction startTick;
++    Fraction endTick;
++    std::map<int, int> velocities; // 第几遍 → 力度
++};
++
+ class AccidentalState;
+ class Chord;
+ class ChordRest;
+@@ -377,6 +387,10 @@ public:
+ 
+     String accessibleInfo() const override;
+ 
++    const std::vector<PlaybackRange>& playbackRanges() const { return m_playbackRanges; }
++    void setPlaybackRanges(const std::vector<PlaybackRange>& r) { m_playbackRanges = r; }
++    void addPlaybackRange(const PlaybackRange& r) { m_playbackRanges.push_back(r); }
++    void clearPlaybackRanges() { m_playbackRanges.clear(); }
+     void styleChanged() override;
+ 
+ #ifndef ENGRAVING_NO_ACCESSIBILITY
+@@ -443,5 +457,7 @@ private:
+     int m_measureNumberOffset = 0;
+     MeasureNumberMode m_measureNumberMode = MeasureNumberMode::AUTO;
+     bool m_breakMultiMeasureRest = false;
++    
++    std::vector<PlaybackRange> m_playbackRanges;
+ };
+ } // namespace mu::engraving
+diff --git a/src/engraving/dom/property.cpp b/src/engraving/dom/property.cpp
+index e497f9ddc1..2f0d99a655 100644
+--- a/src/engraving/dom/property.cpp
++++ b/src/engraving/dom/property.cpp
+@@ -518,7 +518,7 @@ static constexpr PropertyMetaData propertyList[] = {
+     { Pid::STAFF_REFLECT_TRANSPOSITION,         P_TYPE::BOOL,                      PropertyGroup::APPEARANCE, false, "",                                QT_TRANSLATE_NOOP("engraving/propertyName", "reflect transposition") },
+ 
+     { Pid::SHARED_PART_ENABLED,                 P_TYPE::BOOL,                      PropertyGroup::NONE,       false, "sharedPartEnabled",               QT_TRANSLATE_NOOP("engraving/propertyName", "shared part enabled") },
+-
++    { Pid::PLAYBACK_RANGES,                     P_TYPE::STRING,                    PropertyGroup::APPEARANCE, true,  "playbackRanges",                  QT_TRANSLATE_NOOP("engraving/propertyName", "playback ranges") },
+     { Pid::END,                                 P_TYPE::INT,                       PropertyGroup::NONE,       false, "++end++",                         nullptr }
+ };
+ /* *INDENT-ON* */
+diff --git a/src/engraving/dom/property.h b/src/engraving/dom/property.h
+index 60cbb2d007..07f3ca4363 100644
+--- a/src/engraving/dom/property.h
++++ b/src/engraving/dom/property.h
+@@ -528,6 +528,8 @@ enum class Pid : short {
+ 
+     SHARED_PART_ENABLED,
+ 
++    PLAYBACK_RANGES,
++
+     END
+ };
+ 
+diff --git a/src/engraving/playback/playbackcontext.cpp b/src/engraving/playback/playbackcontext.cpp
+index 2793c4148e..92aa7e2808 100644
+--- a/src/engraving/playback/playbackcontext.cpp
++++ b/src/engraving/playback/playbackcontext.cpp
+@@ -35,6 +35,7 @@
+ #include "dom/soundflag.h"
+ #include "dom/staff.h"
+ #include "dom/stafftext.h"
++#include "dom/spanner.h"
+ 
+ #include "engraving/automation/automationdata.h"
+ 
+@@ -88,23 +89,108 @@ dynamic_level_t PlaybackContext::appliableDynamicLevel(const track_idx_t trackId
+ {
+     TRACEFUNC;
+ 
+-    const AutomationCurve* curve = dynamicsCurve(trackIdx);
+-    if (!curve) {
+-        return NATURAL_DYNAMIC_LEVEL;
++        // 1. 查 playbackCount
++    int playbackCount = 0;
++    int utick = nominalPositionTick;
++    auto trackIt = m_playbackCountByTrack.find(trackIdx);
++    if (trackIt != m_playbackCountByTrack.end()) {
++        auto it = trackIt->second.upper_bound(utick);
++        if (it != trackIt->second.begin()) {
++            --it;
++            playbackCount = it->second;
++        }
++    }
++
++    
++    FILE* f2 = fopen("C:/msbuild/debug_utick2.txt", "a");
++    if (f2) {
++        fprintf(f2, "nominalPositionTick=%d utick=%d playbackCount=%d\n",
++                nominalPositionTick, utick, playbackCount);
++        fclose(f2);
+     }
+ 
+-    const auto it = muse::findLessOrEqual(*curve, nominalPositionTick);
+-    if (it == curve->cend()) {
+-        return NATURAL_DYNAMIC_LEVEL;
++    FILE* f3 = fopen("C:/msbuild/debug_count.txt", "a");
++    if (f3) {
++        fprintf(f3, "trackIdx=%d m_playbackCountByTrack.size=%zu\n",
++                trackIdx, m_playbackCountByTrack.size());
++        auto it2 = m_playbackCountByTrack.find(trackIdx);
++        if (it2 != m_playbackCountByTrack.end()) {
++            for (const auto& [tick, cnt] : it2->second) {
++                fprintf(f3, "  tick=%d count=%d\n", tick, cnt);
++            }
++        }
++        fclose(f3);
++    }
++
++    // 2. 查 playbackRanges
++    FILE* f = fopen("C:/msbuild/debug_range.txt", "a");
++    if (f) {
++        fprintf(f, "utick=%d playbackCount=%d\n", utick, playbackCount);
++        Measure* measure2 = m_score->tick2measure(Fraction::fromTicks(
++            m_score->repeatList().utick2tick(nominalPositionTick)));
++        if (measure2) {
++            Measure* rsm = measure2;
++            while (rsm && !rsm->repeatStart()) {
++                rsm = rsm->prevMeasure();
++            }
++            if (rsm) {
++                fprintf(f, "  repeatStartMeasure tick=%d, playbackRanges.size=%zu\n",
++                        rsm->tick().ticks(), rsm->playbackRanges().size());
++                for (const PlaybackRange& r : rsm->playbackRanges()) {
++                    fprintf(f, "    range start=%d end=%d velocities=%zu\n",
++                            r.startTick.ticks(), r.endTick.ticks(), r.velocities.size());
++                    for (const auto& [cnt, velo] : r.velocities) {
++                        fprintf(f, "      count=%d velo=%d\n", cnt, velo);
++                    }
++                }
++            }
++        }
++        fclose(f);
++    }
++    Measure* measure = m_score->tick2measure(Fraction::fromTicks(
++            m_score->repeatList().utick2tick(nominalPositionTick)));
++    if (measure) {
++        Measure* repeatStartMeasure = measure;
++        while (repeatStartMeasure && !repeatStartMeasure->repeatStart()) {
++            repeatStartMeasure = repeatStartMeasure->prevMeasure();
++        }
++        if (repeatStartMeasure) {
++            for (const PlaybackRange& range : repeatStartMeasure->playbackRanges()) {
++                if (utick >= range.startTick.ticks() && utick < range.endTick.ticks()) {
++                    auto it = range.velocities.find(playbackCount);
++                    if (it != range.velocities.end()) {
++                        FILE* f = fopen("C:/msbuild/debug_return.txt", "a");
++                        if (f) {
++                            fprintf(f, "returning %d for utick=%d playbackCount=%d\n",
++                                    it->second, utick, playbackCount);
++                            fclose(f);
++                        }
++                        return it->second;
++                    }
++                }
++            }
++        }
+     }
+ 
+-    const auto next = std::next(it);
+-    if (next == curve->cend()) {
+-        return toDynamicLevel(it->second.value.outValue);
++    // 3. 普通力度逻辑
++    dynamic_level_t baseLevel = NATURAL_DYNAMIC_LEVEL;
++    {
++        const AutomationCurve* curve = dynamicsCurve(trackIdx);
++        if (curve) {
++            const auto it = muse::findLessOrEqual(*curve, nominalPositionTick);
++            if (it != curve->cend()) {
++                const auto next = std::next(it);
++                if (next == curve->cend()) {
++                    baseLevel = toDynamicLevel(it->second.value.outValue);
++                } else {
++                    const real_t t = static_cast<real_t>(nominalPositionTick - it->first) / static_cast<real_t>(next->first - it->first);
++                    baseLevel = toDynamicLevel(muse::mpe::evaluateAt(next->second.value, it->second.value.outValue, t));
++                }
++            }
++        }
+     }
+ 
+-    const real_t t = static_cast<real_t>(nominalPositionTick - it->first) / static_cast<real_t>(next->first - it->first);
+-    return toDynamicLevel(muse::mpe::evaluateAt(next->second.value, it->second.value.outValue, t));
++    return baseLevel;
+ }
+ 
+ std::pair<mpe::timestamp_t, PlayingTechniqueType> PlaybackContext::playingTechnique(const track_idx_t trackIdx,
+@@ -292,7 +378,7 @@ void PlaybackContext::update(const track_idx_t trackFrom, const track_idx_t trac
+     }
+ 
+     m_dynamicsCurveByTrack.clear();
+-
++    m_playbackCountByTrack.clear();
+     for (const RepeatSegment* repeatSegment : m_score->repeatList(expandRepeats)) {
+         const int repeatStartTick = repeatSegment->tick;
+         const int repeatEndTick = repeatSegment->endTick();
+@@ -300,6 +386,11 @@ void PlaybackContext::update(const track_idx_t trackFrom, const track_idx_t trac
+         if (repeatStartTick > tickTo || repeatEndTick <= tickFrom) {
+             continue;
+         }
++        const int playbackCount = repeatSegment->playbackCount;
++        const int utickStart = repeatSegment->utick;
++        for (track_idx_t track = trackFrom; track < trackTo; ++track) {
++            m_playbackCountByTrack[track][utickStart] = playbackCount;
++        }
+ 
+         std::vector<const MeasureRepeat*> measureRepeats;
+         int tickPositionOffset = repeatSegment->utick - repeatSegment->tick;
+@@ -311,7 +402,6 @@ void PlaybackContext::update(const track_idx_t trackFrom, const track_idx_t trac
+             if (measureStartTick > tickTo || measureEndTick <= tickFrom) {
+                 continue;
+             }
+-
+             for (const Segment* segment = measure->first(); segment; segment = segment->next()) {
+                 const int segmentTick = segment->tick().ticks();
+                 if (segmentTick > tickTo) {
+diff --git a/src/engraving/playback/playbackcontext.h b/src/engraving/playback/playbackcontext.h
+index bb8171a7d8..61abf470e4 100644
+--- a/src/engraving/playback/playbackcontext.h
++++ b/src/engraving/playback/playbackcontext.h
+@@ -105,6 +105,7 @@ private:
+ 
+     std::set<track_idx_t> m_usedTracks;
+     mutable std::unordered_map<track_idx_t, const AutomationCurve*> m_dynamicsCurveByTrack;
++    std::map<track_idx_t, std::map<int /*utick*/, int /*playbackCount*/> > m_playbackCountByTrack;
+     SoundPresetsByTrack m_soundPresetsByTrack;
+     TextArticulationsByTrack m_textArticulationsByTrack;
+     SyllablesByTrack m_syllablesByTrack;
+diff --git a/src/engraving/playback/playbackmodel.cpp b/src/engraving/playback/playbackmodel.cpp
+index 97d6df4392..f404e26b3a 100644
+--- a/src/engraving/playback/playbackmodel.cpp
++++ b/src/engraving/playback/playbackmodel.cpp
+@@ -76,6 +76,18 @@ void PlaybackModel::load(Score* score)
+     changesChannel.disconnect(this);
+ 
+     changesChannel.onReceive(this, [this](const ScoreChanges& changes) {
++        FILE* f = fopen("C:/msbuild/debug_changes.txt", "a");
++        if (f) {
++            fprintf(f, "changes received, changedTypes=%zu, changedProperties=%zu\n",
++                    changes.changedTypes.size(), changes.changedPropertyIdSet.size());
++            for (const auto& pid : changes.changedPropertyIdSet) {
++                fprintf(f, "  pid=%d\n", (int)pid);
++            }
++            for (const auto& type : changes.changedTypes) {
++                fprintf(f, "  type=%d\n", (int)type);
++            }
++            fclose(f);
++        }
+         if (shouldSkipChanges(changes)) {
+             return;
+         }
+@@ -787,6 +799,7 @@ bool PlaybackModel::hasToReloadScore(const ScoreChanges& changes) const
+         mu::engraving::Pid::REPEAT_END,
+         mu::engraving::Pid::REPEAT_JUMP,
+         mu::engraving::Pid::REPEAT_COUNT,
++        mu::engraving::Pid::PLAYBACK_RANGES,
+     };
+ 
+     for (const Pid pid: changes.changedPropertyIdSet) {
+diff --git a/src/engraving/rw/read500/measureread.cpp b/src/engraving/rw/read500/measureread.cpp
+index ca3b9f3f73..6b4361bb88 100644
+--- a/src/engraving/rw/read500/measureread.cpp
++++ b/src/engraving/rw/read500/measureread.cpp
+@@ -131,6 +131,29 @@ void MeasureRead::readMeasure(Measure* measure, XmlReader& e, ReadContext& ctx,
+         } else if (tag == "endRepeat") {
+             measure->setRepeatCount(e.readInt());
+             measure->setRepeatEnd(true);
++        } else if (tag == "playbackRanges") {
++            while (e.readNextStartElement()) {
++                if (e.name() == "range") {
++                    PlaybackRange range;
++                    while (e.readNextStartElement()) {
++                        const AsciiStringView t(e.name());
++                        if (t == "startTick") {
++                            range.startTick = Fraction::fromTicks(e.readInt());
++                        } else if (t == "endTick") {
++                            range.endTick = Fraction::fromTicks(e.readInt());
++                        } else if (t == "velocity") {
++                            int count = e.intAttribute("playbackCount");
++                            int velo = e.readInt();
++                            range.velocities[count] = velo;
++                        } else {
++                            e.unknown();
++                        }
++                    }
++                    measure->addPlaybackRange(range);
++                } else {
++                    e.unknown();
++                }
++            }
+         } else if (tag == "vspacer" || tag == "vspacerDown") {
+             if (!measure->mstaves()[staffIdx]->vspacerDown()) {
+                 Spacer* spacer = Factory::createSpacer(measure);
+diff --git a/src/engraving/rw/write/measurewrite.cpp b/src/engraving/rw/write/measurewrite.cpp
+index cfa0a6e2b1..4358035634 100644
+--- a/src/engraving/rw/write/measurewrite.cpp
++++ b/src/engraving/rw/write/measurewrite.cpp
+@@ -73,6 +73,19 @@ void MeasureWrite::writeMeasure(const Measure* measure, XmlWriter& xml, WriteCon
+         if (measure->repeatEnd()) {
+             xml.tag("endRepeat", measure->repeatCount());
+         }
++        if (measure->repeatStart() && !measure->playbackRanges().empty()) {
++            xml.startElement("playbackRanges");
++            for (const PlaybackRange& range : measure->playbackRanges()) {
++                xml.startElement("range");
++                xml.tag("startTick", range.startTick.ticks());
++                xml.tag("endTick", range.endTick.ticks());
++                for (const auto& [count, velo] : range.velocities) {
++                    xml.tag("velocity", { { "playbackCount", count } }, velo);
++                }
++                xml.endElement();
++            }
++            xml.endElement();
++        }
+         TWrite::writeProperty(measure, xml, Pid::EXCLUDE_FROM_NUMBERING);
+         TWrite::writeProperty(measure, xml, Pid::BREAK_MMR);
+         TWrite::writeProperty(measure, xml, Pid::USER_STRETCH);
+diff --git a/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/BarlineSettings.qml b/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/BarlineSettings.qml
+index 5af98191bd..ab6196e3a4 100644
+--- a/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/BarlineSettings.qml
++++ b/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/BarlineSettings.qml
+@@ -23,6 +23,7 @@ pragma ComponentBehavior: Bound
+ 
+ import QtQuick
+ import QtQuick.Layouts
++import QtQuick.Controls
+ 
+ import Muse.Ui
+ import Muse.UiComponents
+@@ -116,6 +117,176 @@ Column {
+         navigationPanel: root.navigationPanel
+         navigationRowStart: playCount.navigationRowEnd + 1
+     }
++    
++    Column {
++        id: playbackRangesSection
++
++        visible: root.model && root.model.playCount
++        width: parent.width
++        spacing: 8
++
++        TextSection {
++            id: playbackRangesInput
++
++            titleText: qsTrc("propertiespanel", "Playback velocities")
++            propertyItem: root.model ? root.model.playbackRanges : null
++
++            navigationPanel: root.navigationPanel
++            navigationRowStart: playCountSection.navigationRowEnd + 1
++        }
++
++        Repeater {
++            model: root.model ? root.model.playbackRangesForUi() : []
++
++            delegate: Column {
++                required property var modelData
++                required property int index
++                readonly property int rangeIndex: index
++
++                width: playbackRangesSection.width
++                spacing: 2
++
++                Row {
++                    spacing: 4
++
++                    StyledTextLabel {
++                        text: qsTrc("propertiespanel", "Range") + " " + (index + 1) + ":"
++                        font: root.font
++                    }
++
++                    TextInput {
++                        width: 50
++                        text: modelData.startTick
++                        onEditingFinished: {
++                            var newRanges = []
++                            var original = root.model.playbackRangesForUi()
++                            for (var i = 0; i < original.length; i++) {
++                                var r = original[i]
++                                var vels = []
++                                for (var j = 0; j < r.velocities.length; j++) {
++                                    vels.push({
++                                        playbackCount: r.velocities[j].playbackCount,
++                                        velocity: r.velocities[j].velocity
++                                    })
++                                }
++                                newRanges.push({
++                                    startTick: r.startTick,
++                                    endTick: r.endTick,
++                                    velocities: vels
++                                })
++                            }
++                            newRanges[index].startTick = parseInt(text)
++                            root.model.setPlaybackRangesFromUi(newRanges)
++                        }
++                    }
++
++                    StyledTextLabel {
++                        text: "-"
++                        font: root.font
++                    }
++
++                    TextInput {
++                        width: 50
++                        text: modelData.endTick
++                        onEditingFinished: {
++                            var newRanges = []
++                            var original = root.model.playbackRangesForUi()
++                            for (var i = 0; i < original.length; i++) {
++                                var r = original[i]
++                                var vels = []
++                                for (var j = 0; j < r.velocities.length; j++) {
++                                    vels.push({
++                                        playbackCount: r.velocities[j].playbackCount,
++                                        velocity: r.velocities[j].velocity
++                                    })
++                                }
++                                newRanges.push({
++                                    startTick: r.startTick,
++                                    endTick: r.endTick,
++                                    velocities: vels
++                                })
++                            }
++                            newRanges[index].endTick = parseInt(text)
++                            root.model.setPlaybackRangesFromUi(newRanges)
++                        }
++                    }
++                }
++
++                Repeater {
++                    model: modelData.velocities
++
++                    delegate: Row {
++                        required property var modelData
++                        required property int index
++
++                        spacing: 4
++
++                        StyledTextLabel {
++                            text: qsTrc("propertiespanel", "Playback")
++                            font: root.font
++                        }
++
++                        TextField {
++                            width: 40
++                            text: modelData.playbackCount
++                            onEditingFinished: {
++                                var newRanges = []
++                                var original = root.model.playbackRangesForUi()
++                                for (var i = 0; i < original.length; i++) {
++                                    var r = original[i]
++                                    var vels = []
++                                    for (var j = 0; j < r.velocities.length; j++) {
++                                        vels.push({
++                                            playbackCount: r.velocities[j].playbackCount,
++                                            velocity: r.velocities[j].velocity
++                                        })
++                                    }
++                                    newRanges.push({
++                                        startTick: r.startTick,
++                                        endTick: r.endTick,
++                                        velocities: vels
++                                    })
++                                }
++                                newRanges[rangeIndex].velocities[index].playbackCount = parseInt(text)
++                                root.model.setPlaybackRangesFromUi(newRanges)
++                            }
++                        }
++
++                        StyledTextLabel {
++                            text: "→"
++                            font: root.font
++                        }
++
++                        TextField {
++                            width: 60
++                            text: modelData.velocity
++                            onEditingFinished: {
++                                var newRanges = []
++                                var original = root.model.playbackRangesForUi()
++                                for (var i = 0; i < original.length; i++) {
++                                    var r = original[i]
++                                    var vels = []
++                                    for (var j = 0; j < r.velocities.length; j++) {
++                                        vels.push({
++                                            playbackCount: r.velocities[j].playbackCount,
++                                            velocity: r.velocities[j].velocity
++                                        })
++                                    }
++                                    newRanges.push({
++                                        startTick: r.startTick,
++                                        endTick: r.endTick,
++                                        velocities: vels
++                                    })
++                                }
++                                newRanges[rangeIndex].velocities[index].velocity = parseInt(text)
++                                root.model.setPlaybackRangesFromUi(newRanges)
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
+ 
+     ExpandableBlank {
+         id: showItem
+@@ -212,7 +383,7 @@ Column {
+ 
+                 width: parent.width
+ 
+-                StyledTextLabel {
++                TextInput {
+                     id: spanPresetsLabel
+                     width: parent.width
+                     text: qsTrc("propertiespanel", "Span presets")
+diff --git a/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.cpp b/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.cpp
+index afe2bbbb3e..342eeea59e 100644
+--- a/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.cpp
++++ b/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.cpp
+@@ -19,12 +19,14 @@
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+  */
++#include "log.h"
+ 
+ #include "barlinesettingsmodel.h"
+ 
+ #include "translation.h"
+ 
+ #include "engraving/dom/barline.h"
++#include "engraving/dom/measure.h"
+ #include "engraving/dom/score.h"
+ #include "engraving/dom/staff.h"
+ 
+@@ -58,6 +60,7 @@ void BarlineSettingsModel::createProperties()
+     m_spanFrom = buildPropertyItem(Pid::BARLINE_SPAN_FROM);
+     m_spanTo = buildPropertyItem(Pid::BARLINE_SPAN_TO);
+     m_hasToShowTips = buildPropertyItem(Pid::BARLINE_SHOW_TIPS);
++    m_playbackRanges = buildPropertyItem(mu::engraving::Pid::PLAYBACK_RANGES);
+ 
+     connect(m_type, &PropertyItem::valueChanged, this, &BarlineSettingsModel::isRepeatStyleChangingAllowedChanged);
+     connect(m_type, &PropertyItem::valueChanged, this, [this]() {
+@@ -91,6 +94,7 @@ void BarlineSettingsModel::loadProperties()
+     };
+ 
+     loadProperties(propertyIdSet);
++    loadPropertyItem(m_playbackRanges);
+ }
+ 
+ void BarlineSettingsModel::onNotationChanged(const mu::engraving::PropertyIdSet& changedPropertyIdSet,
+@@ -269,6 +273,11 @@ PropertyItem* BarlineSettingsModel::playCount() const
+     return m_playCount;
+ }
+ 
++PropertyItem* BarlineSettingsModel::playbackRanges() const
++{
++    return m_playbackRanges;
++}
++
+ PropertyItem* BarlineSettingsModel::playCountText() const
+ {
+     return m_playCountText;
+@@ -322,3 +331,82 @@ bool BarlineSettingsModel::showPlayCount() const
+ {
+     return m_showPlayCount;
+ }
++
++QVariantList BarlineSettingsModel::playbackRangesForUi() const
++{
++    QVariantList result;
++    
++    FILE* f = fopen("C:/msbuild/debug_ranges.txt", "a");
++    if (f) { fprintf(f, "called, size=%zu\n", m_elementList.size()); fclose(f); }
++
++    for (EngravingItem* item : m_elementList) {
++        if (!item->isBarLine()) {
++            continue;
++        }
++        BarLine* bl = toBarLine(item);
++        Measure* measure = bl->measure();
++        if (!measure) {
++            continue;
++        }
++        for (const PlaybackRange& range : measure->playbackRanges()) {
++            QVariantMap rangeMap;
++            rangeMap["startTick"] = range.startTick.ticks();
++            rangeMap["endTick"] = range.endTick.ticks();
++
++            QVariantList velocities;
++            for (const auto& [count, velo] : range.velocities) {
++                QVariantMap v;
++                v["playbackCount"] = count;
++                v["velocity"] = velo;
++                velocities << v;
++            }
++            rangeMap["velocities"] = velocities;
++            result << rangeMap;
++        }
++    }
++    return result;
++}
++
++void BarlineSettingsModel::setPlaybackRangesFromUi(const QVariantList& ranges)
++{
++    undoStack()->prepareChanges(muse::TranslatableString("undoableAction", "Change playback ranges"));
++
++    for (EngravingItem* item : m_elementList) {
++        if (!item->isBarLine()) {
++            continue;
++        }
++        BarLine* bl = toBarLine(item);
++        Measure* measure = bl->measure();
++        if (!measure) {
++            continue;
++        }
++
++        String s;
++        for (const QVariant& rv : ranges) {
++            QVariantMap rangeMap = rv.toMap();
++            if (!s.empty()) {
++                s += u";";
++            }
++            s += String::number(rangeMap["startTick"].toInt()) + u"-"
++                + String::number(rangeMap["endTick"].toInt()) + u":";
++            bool first = true;
++            for (const QVariant& vv : rangeMap["velocities"].toList()) {
++                QVariantMap v = vv.toMap();
++                if (!first) {
++                    s += u",";
++                }
++                first = false;
++                s += String::number(v["playbackCount"].toInt()) + u"="
++                    + String::number(v["velocity"].toInt());
++            }
++        }
++
++        measure->undoChangeProperty(Pid::PLAYBACK_RANGES, PropertyValue(s));
++        FILE* f = fopen("C:/msbuild/debug_undo.txt", "a");
++        if (f) { fprintf(f, "PLAYBACK_RANGES changed: %s\n", s.toStdString().c_str()); fclose(f); }
++        break;
++    }
++
++    undoStack()->commitChanges();
++    updateNotation();
++}
+\ No newline at end of file
+diff --git a/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.h b/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.h
+index ee543755bb..a420bb1591 100644
+--- a/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.h
++++ b/src/propertiespanel/qml/MuseScore/PropertiesPanel/notation/barlines/barlinesettingsmodel.h
+@@ -44,11 +44,15 @@ class BarlineSettingsModel : public PropertiesPanelAbstractModel
+     Q_PROPERTY(bool showPlayCountSettings READ showPlayCountSettings NOTIFY showPlayCountSettingsChanged FINAL)
+     Q_PROPERTY(bool showPlayCount READ showPlayCount NOTIFY showPlayCountChanged FINAL)
+ 
++    Q_PROPERTY(mu::propertiespanel::PropertyItem * playbackRanges READ playbackRanges CONSTANT)
++
+ public:
+     explicit BarlineSettingsModel(QObject* parent, const muse::modularity::ContextPtr& iocCtx, IElementRepositoryService* repository);
+ 
+     Q_INVOKABLE void applySpanPreset(const int presetType);
+     Q_INVOKABLE void setSpanIntervalAsStaffDefault();
++    Q_INVOKABLE QVariantList playbackRangesForUi() const;
++    Q_INVOKABLE void setPlaybackRangesFromUi(const QVariantList& ranges);
+ 
+     PropertyItem* type() const;
+     PropertyItem* playCount() const;
+@@ -58,6 +62,7 @@ public:
+     PropertyItem* spanFrom() const;
+     PropertyItem* spanTo() const;
+     PropertyItem* hasToShowTips() const;
++    PropertyItem* playbackRanges() const;
+ 
+     bool isRepeatStyleChangingAllowed() const;
+     bool showPlayCountSettings() const;
+@@ -88,6 +93,7 @@ private:
+     PropertyItem* m_spanFrom = nullptr;
+     PropertyItem* m_spanTo = nullptr;
+     PropertyItem* m_hasToShowTips = nullptr;
++    PropertyItem* m_playbackRanges = nullptr;
+ 
+     bool m_showPlayCount = false;
+     bool m_showPlayCountSettings = false;
+-- 
+2.56.0.windows.1
+
